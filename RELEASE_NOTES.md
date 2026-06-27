@@ -2,152 +2,129 @@
 
 ---
 
-## v3.0.0 — 2026-06-26 — Full modular refactor (`pipeline/`)
+## v2.0.0 — 2026-06-26 — Full modular refactor
 
-### Resumen
+### Summary
 
-Reescritura completa del pipeline a partir de la versión monolítica (`02_run_pipeline.sh`).
-El código Python embebido como heredoc fue extraído a helpers independientes,
-el trimmer fue unificado a BBDuk, se añadió un rastreador atómico de muestras,
-un bucle de reintentos funcional y una suite de pruebas unitarias.
+Complete rewrite from the original script-based pipeline (`03_quantify.sh`).
+Embedded Python heredocs were extracted into standalone helpers, the trimmer
+was unified to BBDuk, an atomic sample tracker and a functional retry loop
+were added, and a unit test suite was introduced.
 
 ---
 
-### Nuevo en v3
+### What's new
 
-**Arquitectura**
-- Pipeline reorganizado en `config/`, `lib/`, `steps/`, `helpers/` y `tests/`.
-  19 archivos; un único punto de entrada: `bash pipeline/run.sh`.
-- Cada etapa del análisis ocupa su propio archivo en `steps/`:
+**Architecture**
+- Pipeline reorganised into `config/`, `lib/`, `steps/`, `helpers/`, and `tests/`.
+  19 files; single entry point: `bash run.sh`.
+- Each analysis stage has its own file under `steps/`:
   `validate_inputs`, `build_references`, `parse_samples`, `prefetch`,
   `fastq_dump`, `fastqc`, `trim`, `align`, `quantify`, `postprocess`.
 
-**Configuración**
-- `config/species.sh`: array multi-especie con campo `active` (true/false).
-  Agregar o desactivar una especie no requiere modificar código.
-- `config/pipeline.sh`: todas las variables de ejecución en un único archivo
-  sin valores duplicados entre módulos.
+**Configuration**
+- `config/species.sh`: multi-species array with an `active` flag (true/false).
+  Adding or disabling a species requires no code changes.
+- `config/pipeline.sh`: all runtime variables in a single file with no
+  duplicated values across modules.
 
-**Helpers Python independientes**
-- `helpers/parse_runtable.py`: CLI con `argparse`; acepta `.csv` y `.xlsx`;
-  reemplaza el bloque Python embebido (líneas 260–663 de `02_run_pipeline.sh`).
-- `helpers/build_matrix.py`: genera `gene_expression_matrix.tsv` (inner join
-  de todos los `genes.results`), `STAR_mapping_QC_matrix.tsv` y
+**Standalone Python helpers**
+- `helpers/parse_runtable.py`: `argparse` CLI; accepts `.csv` and `.xlsx`;
+  replaces the inline Python block from `02_run_pipeline.sh`.
+- `helpers/build_matrix.py`: produces `gene_expression_matrix.tsv` (inner join
+  of all `genes.results`), `STAR_mapping_QC_matrix.tsv`, and
   `BBDUK_preprocessing_QC_matrix.tsv`.
 
-**Rastreo de muestras**
-- `lib/sample_tracker.sh`: `pipeline_sample_summary.tsv` con 11 columnas
-  (SRR, especie, layout, modo, estado por etapa).
-- Escrituras atómicas: `awk > tmp && mv tmp real` — seguro ante interrupciones.
-- `tracker_is_complete()` via `awk` evita reprocesar muestras exitosas entre
-  pasadas del bucle de reintentos.
+**Sample tracker**
+- `lib/sample_tracker.sh`: `pipeline_sample_summary.tsv` with 11 columns
+  (SRR, species, layout, mode, per-stage status).
+- Atomic writes via `awk > tmp && mv tmp real` — safe against interrupted runs.
+- `tracker_is_complete()` via `awk` prevents reprocessing successful samples
+  across retry passes.
 
-**Bucle de reintentos**
-- `PIPELINE_RETRY_PASSES` en `config/pipeline.sh` ahora está conectado a un
-  bucle `for (( pass=1; pass<=PIPELINE_RETRY_PASSES; pass++ ))` funcional en
-  `run.sh`. En v2 la variable existía pero no tenía bucle externo.
-- Muestras fallidas se reintentan automáticamente en la siguiente pasada.
+**Retry loop**
+- `PIPELINE_RETRY_PASSES` in `config/pipeline.sh` is now wired to a functional
+  `for (( pass=1; pass<=PIPELINE_RETRY_PASSES; pass++ ))` loop in `run.sh`.
+  In v1 the variable existed but had no outer loop.
+- Failed samples are automatically retried on the next pass.
 
 **Trimmer**
-- Trimmomatic reemplazado por **BBDuk** (BBMap suite) de forma consistente.
-  `_bbduk_args()` construye argumentos opcionales (adaptadores, k-mer) en
-  runtime; parámetros obligatorios siempre presentes.
-- Eliminada la inconsistencia entre `config.sh` (definía BBDuk) y
-  `03_quantify.sh` (llamaba a Trimmomatic) que existía en v1 y v2.
+- Trimmomatic replaced consistently by **BBDuk** (BBMap suite).
+  `_bbduk_args()` builds optional arguments (adapters, k-mer) at runtime;
+  mandatory parameters are always appended.
+- Removed the inconsistency where `config.sh` declared BBDuk but
+  `03_quantify.sh` called Trimmomatic.
 
-**STAR y RSEM separados**
-- `step_rsem()` de v1/v2 acoplaba STAR y RSEM en una sola función.
-  En v3: `steps/align.sh` (`step_star`) y `steps/quantify.sh` (`step_rsem`)
-  son independientes — es posible re-ejecutar sólo RSEM sobre un BAM existente.
-- `_STAR_FLAGS` declarado como array a nivel de módulo en `steps/align.sh`,
-  auditables en un solo lugar.
+**STAR and RSEM decoupled**
+- The v1 `step_rsem()` coupled STAR and RSEM in a single function.
+  In v2: `steps/align.sh` (`step_star`) and `steps/quantify.sh` (`step_rsem`)
+  are independent — RSEM can be re-run against an existing BAM without
+  repeating alignment.
+- `_STAR_FLAGS` declared as a module-level array in `steps/align.sh`,
+  auditable in one place.
 
 **Logging**
-- `log_step()` escribe a stdout **y** a `logs/<SRR>.log` (acumulativo por
-  muestra). En v1/v2 sólo escribía a stdout.
-- Cada herramienta tiene su propio archivo de log por muestra:
+- `log_step()` writes to stdout **and** to `logs/<SRR>.log` (cumulative per
+  sample). In v1 it only wrote to stdout.
+- Each tool has its own per-sample log file:
   `_bbduk.log`, `_star.log`, `_STAR_Log.final.out`, `_rsem.log`.
 
-**Validación de herramientas**
-- `check_tools` reporta **todos** los binarios faltantes antes de abortar.
-  En v2, `check_tool()` abortaba al primer faltante.
+**Tool validation**
+- `check_tools` reports **all** missing binaries before aborting.
+  In v1, `check_tool()` aborted on the first missing tool.
 
-**Pruebas unitarias**
-- `tests/test_pipeline.sh`: 17 pruebas bash sin dependencias externas.
-  Cubre `normalize_layout` (8 casos), `require_file`, `detect_inputs` y
-  `parse_runtable.py`. Resultado: 17 passed, 0 failed.
+**Unit tests**
+- `tests/test_pipeline.sh`: 17 bash tests with no external dependencies.
+  Covers `normalize_layout` (8 cases), `require_file`, `detect_inputs`, and
+  `parse_runtable.py`. Result: 17 passed, 0 failed.
 
-**Post-procesamiento integrado**
-- `steps/postprocess.sh` + `helpers/build_matrix.py` integrados en el flujo
-  principal. En v1/v2 no existía generación automática de matrices de expresión
-  ni de QC al finalizar el pipeline.
-
----
-
-### Cambios respecto a v2 (`02_run_pipeline.sh`)
-
-| Aspecto | v2 | v3 |
-|:--------|:---|:---|
-| Archivos | 2 (`01_config.sh` + `02_run_pipeline.sh`) | 19 archivos en `pipeline/` |
-| Python | Heredoc embebido (líneas 260–663) | Scripts independientes con `argparse` |
-| Trimmer | Trimmomatic | BBDuk |
-| Soporte multi-especie | Una especie por ejecución (`SPECIES_NAME`) | N especies con flag `active` |
-| Rastreador de muestras | No | `pipeline_sample_summary.tsv` atómico |
-| Bucle de reintentos | Variable declarada, sin bucle | Bucle funcional `for pass in 1..N` |
-| `check_tools` | Aborta al primer faltante | Reporta todos los faltantes |
-| STAR + RSEM | Acoplados en `step_rsem()` | `steps/align.sh` + `steps/quantify.sh` independientes |
-| Log por muestra | No | `logs/<SRR>.log` acumulativo |
-| Pruebas unitarias | No | 17 pruebas, 0 dependencias externas |
-| Matrices de expresión | No | `gene_expression_matrix.tsv` + 2 matrices QC |
+**Integrated post-processing**
+- `steps/postprocess.sh` + `helpers/build_matrix.py` run automatically at the
+  end of the pipeline. In v1 there was no automatic expression matrix or QC
+  matrix generation.
 
 ---
 
-### Cambios respecto a v1 (`config.sh` + `03_quantify.sh` + `lib/`)
+### Changes from v1
 
-| Aspecto | v1 | v3 |
-|:--------|:---|:---|
-| Archivos | 7 | 19 |
-| Trimmer | Config definía BBDuk; `03_quantify.sh` llamaba Trimmomatic (inconsistencia) | BBDuk consistente en config y en `steps/trim.sh` |
-| STAR + RSEM | Acoplados en `step_rsem()` | Separados en `align.sh` y `quantify.sh` |
-| Rastreador de muestras | No | `pipeline_sample_summary.tsv` |
-| Bucle de reintentos | No | Funcional con `PIPELINE_RETRY_PASSES` |
-| Idempotencia | `[[ -f genes.results ]]` | `tracker_is_complete()` vía TSV |
-| Python | Script autónomo (`02_prepare_samples.py`) | Helpers con `argparse` + `build_matrix.py` adicional |
-| Pruebas unitarias | No | 17 pruebas |
-
----
-
-### Bugs corregidos
-
-- **`(( _pass++ ))` bajo `set -e`:** el post-incremento evalúa el valor anterior
-  (0 en la primera iteración), que es falso para bash aritmético, causando
-  salida inmediata con código 1 cuando `_pass=0`. Corregido a `(( ++_pass ))`.
-- **`exit 1` en `require_file` mata el proceso de pruebas:** `assert_fails` en
-  `tests/test_pipeline.sh` ahora envuelve el comando en subshell `( "$@" )` para
-  que `exit 1` sólo termine el subshell.
-- **`PIPELINE_RETRY_PASSES` declarado pero no consumido (v2):** la variable
-  existía en `01_config.sh` pero no había bucle externo en `02_run_pipeline.sh`.
-  Corregido en v3 con bucle `for (( pass=1; ... ))` en `run.sh`.
-- **Inconsistencia de trimmer (v1 y v2):** `config.sh` definía `TRIMMER="bbduk"`
-  pero los scripts de cuantificación invocaban Trimmomatic. Unificado a BBDuk.
+| Aspect | v1 | v2 |
+|:-------|:---|:---|
+| Files | 7 | 19 |
+| Entry point | `bash 03_quantify.sh` | `bash run.sh [--test\|--full\|--build-refs]` |
+| Trimmer | Config declared BBDuk; `03_quantify.sh` called Trimmomatic (inconsistency) | BBDuk consistent in config and `steps/trim.sh` |
+| STAR + RSEM | Coupled in `step_rsem()` | Decoupled into `steps/align.sh` and `steps/quantify.sh` |
+| Multi-species support | Yes, via `SPECIES_CONFIG` array, but trimmer inconsistency | Yes, with `active` flag per species |
+| Sample tracker | No | `pipeline_sample_summary.tsv` (atomic writes) |
+| Retry loop | No | Functional via `PIPELINE_RETRY_PASSES` |
+| Idempotency | `[[ -f genes.results ]]` | `tracker_is_complete()` via TSV |
+| Python | Standalone script (`02_prepare_samples.py`) | `argparse` helpers + new `build_matrix.py` |
+| Per-sample log | stdout only | `logs/<SRR>.log` cumulative |
+| Unit tests | No | 17 tests, no external dependencies |
+| Expression matrix | No | `gene_expression_matrix.tsv` + 2 QC matrices |
 
 ---
 
-## v2.0.0 — 2026-06 — Pipeline monolítico refactorizado
+### Bug fixes
 
-Refactor intermedio a partir de v1. Consolidó todo el flujo en `02_run_pipeline.sh`
-con funciones bien delimitadas. Introdujo `PREFETCH_RETRIES`, `PIPELINE_RETRY_PASSES`
-(sin bucle), `detect_inputs()` y el bloque Python como heredoc para parsear
-el RunTable. Mejoró el logging con timestamps. No resolvió la separación
-STAR/RSEM ni añadió rastreador de muestras.
+- **`(( _pass++ ))` under `set -e`:** post-increment evaluates the old value
+  (0 on the first iteration), which is falsy in bash arithmetic, causing an
+  immediate exit with code 1 when `_pass=0`. Fixed to `(( ++_pass ))`.
+- **`exit 1` in `require_file` kills the test process:** `assert_fails` in
+  `tests/test_pipeline.sh` now wraps the command in a subshell `( "$@" )` so
+  that `exit 1` only exits the subshell, not the test runner.
+- **`PIPELINE_RETRY_PASSES` declared but never consumed (v1):** the variable
+  existed in `config.sh` but there was no outer loop in `03_quantify.sh`.
+  Fixed in v2 with `for (( pass=1; ... ))` in `run.sh`.
+- **Trimmer inconsistency (v1):** `config.sh` set `TRIMMER="bbduk"` but the
+  quantification scripts called Trimmomatic. Unified to BBDuk throughout.
 
 ---
 
-## v1.0.0 — 2026-06 — Pipeline modular original
+## v1.0.0 — 2026-06 — Original modular pipeline
 
-Primera versión modular: `config.sh`, `00_setup.sh`, `01_build_references.sh`,
+First modular version: `config.sh`, `00_setup.sh`, `01_build_references.sh`,
 `02_prepare_samples.py`, `03_quantify.sh`, `lib/utils.sh`, `lib/cleanup.sh`.
-Separó configuración, referencias, parseo de muestras y cuantificación en
-archivos distintos. Introdujo `check_all_tools` (reporta todos los faltantes),
-`lib/cleanup.sh` y `lib/utils.sh`. Presentó inconsistencia de trimmer
-(config BBDuk vs. ejecución Trimmomatic) y sin rastreador de muestras.
+Separated configuration, reference building, sample parsing, and quantification
+into distinct files. Introduced `check_all_tools` (reports all missing tools),
+`lib/cleanup.sh`, and `lib/utils.sh`. Had a trimmer inconsistency (config
+declared BBDuk, scripts called Trimmomatic) and no sample tracker or retry loop.
