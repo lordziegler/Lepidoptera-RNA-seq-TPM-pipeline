@@ -9,6 +9,8 @@ DISK_WARN_GB=5
 mkdir -p "$LOG_DIR"
 
 source "${PIPELINE_DIR}/lib/utils.sh"
+source "${PIPELINE_DIR}/lib/cleanup.sh"
+source "${PIPELINE_DIR}/steps/build_references.sh"
 source "${PIPELINE_DIR}/steps/validate_inputs.sh"
 
 _pass=0
@@ -67,6 +69,86 @@ touch "${tmpd}/extra.fa.gz"
 assert_fails "detect_inputs two FASTAs" detect_inputs "$tmpd"
 rm -rf "$tmpd"
 
+# --- cleanup_on_error ---------------------------------------------------------
+tmpd="$(mktemp -d)"
+TMP_DIR="$tmpd"
+mkdir -p "${TMP_DIR}/TESTSRR_star" "${TMP_DIR}/TESTSRR_rsem_tmp"
+touch "${tmpd}/partial.genes.results" "${tmpd}/partial.isoforms.results"
+
+cleanup_on_error "TESTSRR" "${tmpd}/partial.genes.results" "${tmpd}/partial.isoforms.results"
+
+assert_eq "cleanup_on_error removes extra files" \
+    "$([[ -f "${tmpd}/partial.genes.results" ]] && echo present || echo gone)" "gone"
+assert_eq "cleanup_on_error removes STAR tmp dir" \
+    "$([[ -d "${TMP_DIR}/TESTSRR_star" ]] && echo present || echo gone)" "gone"
+assert_eq "cleanup_on_error removes RSEM tmp dir" \
+    "$([[ -d "${TMP_DIR}/TESTSRR_rsem_tmp" ]] && echo present || echo gone)" "gone"
+rm -rf "$tmpd"
+
+# --- SIGINT triggers cleanup_on_error via trap --------------------------------
+tmpd="$(mktemp -d)"
+mkdir -p "${tmpd}/TESTSRR_star"
+
+command cat > "${tmpd}/trap_test.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+TMP_DIR="TMPD_PLACEHOLDER"
+LOG_DIR="TMPD_PLACEHOLDER"
+source "PIPELINE_DIR_PLACEHOLDER/lib/utils.sh"
+source "PIPELINE_DIR_PLACEHOLDER/lib/cleanup.sh"
+CURRENT_SRR="TESTSRR"
+trap 'cleanup_on_error "$CURRENT_SRR"; exit 130' SIGINT SIGTERM
+sleep 10
+EOF
+
+# Replace placeholders in the script
+sed -i "s|TMPD_PLACEHOLDER|${tmpd}|g" "${tmpd}/trap_test.sh"
+sed -i "s|PIPELINE_DIR_PLACEHOLDER|${PIPELINE_DIR}|g" "${tmpd}/trap_test.sh"
+chmod +x "${tmpd}/trap_test.sh"
+
+timeout -s INT 1 "${tmpd}/trap_test.sh" 2>/dev/null || true
+
+assert_eq "SIGINT cleanup removes STAR tmp dir" \
+    "$([[ -d "${tmpd}/TESTSRR_star" ]] && echo present || echo gone)" "gone"
+rm -rf "$tmpd"
+
+# --- _decompress_or_download: aborts on corrupt existing .gz ------------------
+tmpd="$(mktemp -d)"
+printf 'not a real gzip file' > "${tmpd}/genome.fna.gz"
+
+assert_fails "corrupt existing .gz aborts" \
+    _decompress_or_download "http://example.invalid/genome.fna.gz" \
+        "${tmpd}/genome.fna.gz" "${tmpd}/genome.fa"
+rm -rf "$tmpd"
+
+# --- _decompress_or_download: retries transient download failures ------------
+tmpd="$(mktemp -d)"
+_attempt_count=0
+wget() {
+    _attempt_count=$(( _attempt_count + 1 ))
+    local out=""
+    while [[ $# -gt 0 ]]; do
+        if [[ "$1" == "-O" ]]; then out="$2"; shift; fi
+        shift
+    done
+    if [[ "$_attempt_count" -lt 3 ]]; then
+        return 1
+    fi
+    printf 'fake genome content' | gzip -c > "$out"
+    return 0
+}
+REF_DOWNLOAD_RETRIES=3
+REF_DOWNLOAD_RETRY_SLEEP=0
+
+_decompress_or_download "http://example.invalid/genome.fna.gz" \
+    "${tmpd}/genome.fna.gz" "${tmpd}/genome.fa"
+
+assert_eq "download retried until success" "$_attempt_count" "3"
+assert_eq "final decompressed file created" \
+    "$([[ -f "${tmpd}/genome.fa" ]] && echo yes || echo no)" "yes"
+unset -f wget
+rm -rf "$tmpd"
+
 # --- parse_runtable.py -------------------------------------------------------
 tmpd="$(mktemp -d)"
 cat > "${tmpd}/SraRunTable.csv" <<'CSV'
@@ -87,6 +169,30 @@ assert_eq "parse_runtable: correct SRR"    "$got_srr"  "SRR123456"
 
 got_layout="$(awk -F'\t' 'NR==2{print $3}' "${tmpd}/samples.tsv")"
 assert_eq "parse_runtable: correct layout" "$got_layout" "PAIRED"
+rm -rf "$tmpd"
+
+# --- flock prevents concurrent execution ------------------------------------
+tmpd="$(mktemp -d)"
+lockfile="${tmpd}/pipeline.lock"
+
+(
+    exec 200>"$lockfile"
+    flock -n 200 || exit 1
+    sleep 1
+) &
+holder_pid=$!
+sleep 0.3
+
+set +e
+(
+    exec 201>"$lockfile"
+    flock -n 201
+)
+second_result=$?
+set -e
+wait "$holder_pid"
+
+assert_eq "second concurrent lock attempt is rejected" "$second_result" "1"
 rm -rf "$tmpd"
 
 # --- Summary -----------------------------------------------------------------

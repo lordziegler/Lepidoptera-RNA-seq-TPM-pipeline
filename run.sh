@@ -28,6 +28,20 @@ source "${PIPELINE_DIR}/steps/align.sh"
 source "${PIPELINE_DIR}/steps/quantify.sh"
 source "${PIPELINE_DIR}/steps/postprocess.sh"
 
+# --- Signal handling ----------------------------------------------------------
+CURRENT_SRR=""
+
+_on_interrupt() {
+    echo ""
+    echo "[INTERRUPT] Signal received — cleaning up in-progress sample ..."
+    if [[ -n "$CURRENT_SRR" ]]; then
+        cleanup_on_error "$CURRENT_SRR"
+        log_step "$CURRENT_SRR" "INTERRUPT" "Run interrupted by signal; partial files removed."
+    fi
+    exit 130
+}
+trap _on_interrupt SIGINT SIGTERM
+
 # --- Argument parsing --------------------------------------------------------
 BUILD_REFS_ONLY=false
 
@@ -46,6 +60,13 @@ done
 # --- Setup -------------------------------------------------------------------
 mkdir -p "$LOG_DIR" "$TMP_DIR" "$RESULTS_DIR/rsem" \
          sra fastq clean_fastq fastqc_out
+
+LOCK_FILE="${TMP_DIR}/pipeline.lock"
+exec 200>"$LOCK_FILE"
+if ! flock -n 200; then
+    echo "[ABORT] Another instance of run.sh is already running (lock: ${LOCK_FILE})."
+    exit 1
+fi
 
 echo "============================================================"
 echo " Lepidoptera RNA-seq TPM pipeline"
@@ -75,12 +96,13 @@ _process_sample() {
     local species_out="${RESULTS_DIR}/rsem/${species}"
     local pre_s="PENDING" fq_s="PENDING" trim_s="PENDING" \
           star_s="PENDING" rsem_s="PENDING" genes="NA"
+    CURRENT_SRR="$srr"
 
     resolve_reference_paths "$species"
     mkdir -p "$species_out"
 
     step_prefetch "$srr"                                   && pre_s="OK"  || { tracker_update "$srr" "$species" "$layout" "FAILED" "NA"  "NA"   "NA"   "NA"  "NA"; return; }
-    step_fastq_dump "$srr" "$layout"                       && fq_s="OK"   || { tracker_update "$srr" "$species" "$layout" "$pre_s" "FAILED" "NA" "NA"   "NA"  "NA"; return; }
+    step_fastq_dump "$srr" "$layout"                       && fq_s="OK"   || { cleanup_on_error "$srr" "${RAW_1:-}" "${RAW_2:-}" "${RAW_SE:-}"; tracker_update "$srr" "$species" "$layout" "$pre_s" "FAILED" "NA" "NA"   "NA"  "NA"; return; }
 
     [[ "$CLEAN_SRA_AFTER_FASTQ" == true ]] && cleanup_sra "$srr" "$SRA_PATH"
 
@@ -90,7 +112,7 @@ _process_sample() {
         step_fastqc "$srr" "RAW" "$RAW_SE"
     fi
 
-    step_bbduk "$srr" "$layout"                            && trim_s="OK" || { tracker_update "$srr" "$species" "$layout" "$pre_s" "$fq_s" "FAILED" "NA" "NA" "NA"; return; }
+    step_bbduk "$srr" "$layout"                            && trim_s="OK" || { cleanup_on_error "$srr" "${CLEAN_1:-}" "${CLEAN_2:-}" "${CLEAN_SE:-}" "${SINGLETONS:-}"; tracker_update "$srr" "$species" "$layout" "$pre_s" "$fq_s" "FAILED" "NA" "NA" "NA"; return; }
 
     [[ "$CLEAN_RAW_FASTQ_AFTER_RSEM" == true ]] && cleanup_raw_fastq "$srr" "${RAW_1:-}" "${RAW_2:-}" "${RAW_SE:-}"
 
@@ -103,9 +125,9 @@ _process_sample() {
         step_multiqc_sample "$srr" "SINGLE"
     fi
 
-    step_star "$srr" "$layout"                             && star_s="OK" || { tracker_update "$srr" "$species" "$layout" "$pre_s" "$fq_s" "$trim_s" "FAILED" "NA" "NA"; return; }
+    step_star "$srr" "$layout"                             && star_s="OK" || { cleanup_on_error "$srr"; tracker_update "$srr" "$species" "$layout" "$pre_s" "$fq_s" "$trim_s" "FAILED" "NA" "NA"; return; }
 
-    step_rsem "$srr" "$layout" "$species_out"              && rsem_s="OK" || { tracker_update "$srr" "$species" "$layout" "$pre_s" "$fq_s" "$trim_s" "$star_s" "FAILED" "NA"; return; }
+    step_rsem "$srr" "$layout" "$species_out"              && rsem_s="OK" || { cleanup_on_error "$srr" "${species_out}/${srr}.genes.results" "${species_out}/${srr}.isoforms.results"; tracker_update "$srr" "$species" "$layout" "$pre_s" "$fq_s" "$trim_s" "$star_s" "FAILED" "NA"; return; }
 
     genes="${species_out}/${srr}.genes.results"
     cleanup_star_tmp "$srr"
